@@ -1,0 +1,87 @@
+# Gemini 图像生成流水线配置
+project: your-gcp-project-id
+
+# Stage 1: Flash 提示词优化
+flash_temperature: 0.7
+
+# Stage 2: Pro Image 生成
+generation_config:
+  model: gemini-3-pro-image
+  temperature: 0.3
+  top_p: 0.5
+  aspect_ratio: "1:1"
+
+# 参考图片（路径相对于本配置文件所在目录）
+images:
+- file: images/raccoon_ref.jpeg
+  role: 浣熊角色参考
+- file: images/style_ref.jpeg
+  role: 整体风格参考
+- file: images/chick_ref.jpeg
+  role: 小鸡角色参考
+- file: images/fox_ref.jpeg
+  role: 狐狸角色参考
+- file: images/owl_ref.jpeg
+  role: 猫头鹰角色参考
+- file: images/owl_scene_ref.png
+  role: 猫头鹰场景参考
+- file: images/frog_ref.png
+  role: 青蛙角色参考
+- file: images/frog_full_ref.png
+  role: 青蛙全身参考
+- file: images/bear_ref.jpeg
+  role: 熊角色参考
+- file: images/bear_scene_ref.png
+  role: 熊场景参考
+
+# 生成设置
+num_images: 3
+output_dir: ./output
+output_prefix: shuanglin
+
+# 用户生成需求
+user_request: |
+  以下是原始提示词，请在此基础上优化并生成最终图像生成提示词：
+
+  === TASK ===
+  Generate image
+
+  === GLOBAL STYLE ===
+  Style: Q版3D角色风格，角色比例夸张（大头小身），造型圆润可爱，表情生动夸张，场景元素丰富且布局紧凑，视角多为平视，线条细腻流畅，质感光滑细腻
+  Color Palette: 高饱和明亮配色，色彩鲜艳活泼，主色调明快温暖
+  Lighting: 柔和均匀光照，高光柔和，阴影边缘圆润，整体氛围明亮清新
+  Refs:
+  [IMG_2]
+
+  === WORLD LORE ===
+  3D 卡通
+
+  === SUBJECTS ===
+  Name: xiaohuan raccoon
+  Type: character
+  Desc: 棕橙色身体，深棕色眼周斑纹，戴绿色小礼帽（星星装饰），穿绿色背带裤，黄色蝴蝶结领结，大条纹尾巴
+  Refs: [IMG_1]
+
+  Name: laimen chick
+  Type: character
+  Desc: 圆润黄色小鸡，红色鸡冠，橙色喙和脚爪，圆形身体，小黄色翅膀
+  Refs: [IMG_3]
+
+  Name: meme fox
+  Type: character
+  Refs: [IMG_4]
+
+  Name: zimi owl
+  Type: character
+  Refs: [IMG_5] [IMG_6]
+
+  Name: aido frog
+  Type: character
+  Refs: [IMG_7] [IMG_8]
+
+  Name: lixiong bear
+  Type: character
+  Refs: [IMG_9] [IMG_10]
+
+  === USER INPUT ===
+  3D卡通风格，水平视角，小动物们在山西双林寺里玩耍，有古建，古塔，古树@xiaohuan raccoon @laimen chick @meme fox @zimi owl @aido frog @lixiong bear

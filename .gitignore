@@ -5,6 +5,8 @@ output/
 *.png
 *.jpeg
 *.jpg
+.adk/
+session.db
 nohup.out
 config_v*.yaml
 config_beach.yaml
@@ -12,5 +14,3 @@ config_example.yaml
 config_forest.yaml
 config_lowtemp.yaml
 request.yaml
-.adk/
-session.db

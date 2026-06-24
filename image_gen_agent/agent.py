@@ -269,7 +269,7 @@ async def generate_images(num_images: int, tool_context: ToolContext) -> dict:
     parts.append({"text": optimized_prompt})
 
     url = (f"https://aiplatform.googleapis.com/v1/projects/{PROJECT}"
-           f"/locations/{REGION}/publishers/google/models/gemini-3-pro-image:generateContent")
+           f"/locations/{REGION}/publishers/google/models/gemini-3.1-flash-image:generateContent")
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
     request_body = {
         "contents": [{"role": "USER", "parts": parts}],
@@ -523,7 +523,7 @@ async def edit_image(image_name: str, edit_instruction: str, tool_context: ToolC
     parts.append({"text": edit_prompt})
 
     url = (f"https://aiplatform.googleapis.com/v1/projects/{PROJECT}"
-           f"/locations/{REGION}/publishers/google/models/gemini-3-pro-image:generateContent")
+           f"/locations/{REGION}/publishers/google/models/gemini-3.1-flash-image:generateContent")
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
     request_body = {
         "contents": [{"role": "USER", "parts": parts}],

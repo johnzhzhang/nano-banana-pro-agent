@@ -414,15 +414,24 @@ async def evaluate_and_select(num_target: int, tool_context: ToolContext) -> dic
     best_score = all_scores.get(best_idx, 0) if best_idx else 0
 
     # Save final selected images as final_1, final_2, ...
+    final_parts = []
     if len(all_passed) >= num_target:
         for out_i, src_idx in enumerate(all_passed[:num_target], 1):
             art = await tool_context.load_artifact(filename=f"candidate_{src_idx}.png")
             if art:
                 await tool_context.save_artifact(filename=f"final_{out_i}.png", artifact=art)
+                final_parts.append(art)
         logger.info(f"  🎉 Got {num_target} passing images! Saved as final_1...{num_target}.png")
 
     still_needed = max(0, num_target - len(all_passed))
     logger.info(f"  📋 Total: {len(all_passed)} passed, {len(all_failed_list)} failed, need {still_needed} more (best={best_score}/10)")
+
+    # If goal reached, output images directly in chat
+    if final_parts:
+        response_parts = [types.Part(text=f"✅ 已选出 {len(final_parts)} 张合格图片：")]
+        response_parts.extend(final_parts)
+        tool_context.actions.skip_summarization = True
+        tool_context.actions.escalate = True
 
     return {
         "status": "success",
@@ -615,6 +624,9 @@ async def edit_image(image_name: str, edit_instruction: str, tool_context: ToolC
         best_artifact = types.Part(inline_data=types.Blob(data=edit_candidates[best_idx], mime_type="image/png"))
         await tool_context.save_artifact(filename=image_name, artifact=best_artifact)
         logger.info(f"  🎉 Edit passed! Replaced {image_name} with candidate {best_idx+1} (score={best_score})")
+        # Show edited image inline in chat
+        tool_context.actions.skip_summarization = True
+        tool_context.actions.escalate = True
         return {
             "status": "success",
             "replaced": True,

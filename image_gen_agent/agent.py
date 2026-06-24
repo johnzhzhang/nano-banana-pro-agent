@@ -18,7 +18,8 @@ PROJECT = os.environ.get("GOOGLE_CLOUD_PROJECT", "john-poc-453315")
 REGION = os.environ.get("GOOGLE_CLOUD_REGION", "global")
 REF_IMAGES_DIR = os.environ.get("REF_IMAGES_DIR", "/tmp/nano_images")
 
-CHARACTER_REFS = [
+# Default character refs (can be overridden by user uploads)
+DEFAULT_REFS = [
     {"file": "a166e269a528cd48faa4848d9617600a249083.jpeg", "role": "浣熊角色参考"},
     {"file": "2dc690e2357fef10fb6260f6d73bcbad152534.jpeg", "role": "整体风格参考"},
     {"file": "c21f5ca4f07cec444ce5625085c27445132701.jpeg", "role": "小鸡角色参考"},
@@ -118,10 +119,9 @@ def _get_mime(path):
 
 
 def _build_ref_parts():
-    """Build reference image parts — uses only active refs from state, falls back to all."""
-    # This is the static version; tools will pass active_refs explicitly
+    """Build ALL default reference image parts."""
     parts = []
-    for img_info in CHARACTER_REFS:
+    for img_info in DEFAULT_REFS:
         path = os.path.join(REF_IMAGES_DIR, img_info["file"])
         if os.path.exists(path):
             parts.append({"inline_data": {"mime_type": _get_mime(path), "data": _load_image_b64(path)}})
@@ -129,14 +129,24 @@ def _build_ref_parts():
 
 
 def _build_active_ref_parts(active_indices):
-    """Build reference image parts for only the specified indices (1-based)."""
+    """Build reference image parts for only the specified indices (1-based) from DEFAULT_REFS."""
     parts = []
     for i in active_indices:
-        if 1 <= i <= len(CHARACTER_REFS):
-            img_info = CHARACTER_REFS[i - 1]
+        if 1 <= i <= len(DEFAULT_REFS):
+            img_info = DEFAULT_REFS[i - 1]
             path = os.path.join(REF_IMAGES_DIR, img_info["file"])
             if os.path.exists(path):
                 parts.append({"inline_data": {"mime_type": _get_mime(path), "data": _load_image_b64(path)}})
+    return parts
+
+
+def _build_session_ref_parts(session_refs):
+    """Build reference image parts from session state (user-uploaded images).
+    session_refs: list of {"role": str, "data": base64_str, "mime_type": str}
+    """
+    parts = []
+    for ref in session_refs:
+        parts.append({"inline_data": {"mime_type": ref["mime_type"], "data": ref["data"]}})
     return parts
 
 
@@ -154,19 +164,64 @@ async def save_memories_callback(callback_context: CallbackContext):
 # === Tools ===
 
 async def select_references(indices: list[int], tool_context: ToolContext) -> dict:
-    """Select which reference images to use for this generation session.
-    Call this BEFORE optimize_prompt to specify which refs are relevant.
+    """Select which default reference images to use, combined with any user-uploaded refs.
 
     Args:
-        indices: List of 1-based indices into the available reference images. Available refs:
+        indices: List of 1-based indices from default refs. Available:
                  1=浣熊, 2=风格参考, 3=小鸡, 4=狐狸, 5=猫头鹰, 6=猫头鹰场景,
-                 7=青蛙, 8=青蛙全身, 9=熊, 10=熊场景
+                 7=青蛙, 8=青蛙全身, 9=熊, 10=熊场景.
+                 Pass empty list [] if only using user-uploaded images.
     """
-    valid = [i for i in indices if 1 <= i <= len(CHARACTER_REFS)]
+    valid = [i for i in indices if 1 <= i <= len(DEFAULT_REFS)]
     tool_context.state["active_refs"] = valid
-    selected = [CHARACTER_REFS[i-1]["role"] for i in valid]
-    logger.info(f"📋 [Select] Active refs: {selected}")
-    return {"status": "success", "active_refs": selected, "indices": valid}
+    selected = [DEFAULT_REFS[i-1]["role"] for i in valid]
+
+    # Also report user-uploaded refs
+    session_refs = tool_context.state.get("session_refs", [])
+    uploaded = [r["role"] for r in session_refs]
+
+    logger.info(f"📋 [Select] Default refs: {selected}, User refs: {uploaded}")
+    return {
+        "status": "success",
+        "default_refs_selected": selected,
+        "user_uploaded_refs": uploaded,
+        "total_ref_count": len(valid) + len(session_refs)
+    }
+
+
+async def add_reference_image(role: str, tool_context: ToolContext) -> dict:
+    """Register a user-uploaded image as a reference. The user must attach the image in their message.
+    This tool extracts the most recent image from the conversation.
+
+    Args:
+        role: What this image represents, e.g. "机器人角色参考" or "赛博朋克风格参考"
+    """
+    logger.info(f"📤 [AddRef] Adding reference: {role}")
+
+    # Search recent session events for user-uploaded images
+    img_data = None
+    for event in reversed(tool_context.session.events):
+        if event.content and event.content.parts:
+            for part in event.content.parts:
+                if hasattr(part, 'inline_data') and part.inline_data and part.inline_data.data:
+                    img_data = {
+                        "role": role,
+                        "data": base64.b64encode(part.inline_data.data).decode(),
+                        "mime_type": part.inline_data.mime_type or "image/png"
+                    }
+                    break
+        if img_data:
+            break
+
+    if not img_data:
+        return {"status": "error", "message": "未找到上传的图片。请在消息中附带图片后重试。"}
+
+    session_refs = tool_context.state.get("session_refs", [])
+    session_refs.append(img_data)
+    tool_context.state["session_refs"] = session_refs
+
+    logger.info(f"  ✅ Added user ref: {role} (total: {len(session_refs)})")
+    return {"status": "success", "role": role, "total_user_refs": len(session_refs)}
 
 
 async def optimize_prompt(scene_description: str, tool_context: ToolContext) -> dict:
@@ -181,18 +236,25 @@ async def optimize_prompt(scene_description: str, tool_context: ToolContext) -> 
 
     parts = [{"text": OPTIMIZER_SYSTEM}]
 
-    # Use only active refs if set, otherwise all
+    # Use only active refs if set, otherwise all defaults
     active = tool_context.state.get("active_refs")
     if active:
         ref_parts = _build_active_ref_parts(active)
-        active_refs_info = [CHARACTER_REFS[i-1] for i in active if 1 <= i <= len(CHARACTER_REFS)]
+        active_refs_info = [DEFAULT_REFS[i-1] for i in active if 1 <= i <= len(DEFAULT_REFS)]
     else:
         ref_parts = _build_ref_parts()
-        active_refs_info = CHARACTER_REFS
+        active_refs_info = DEFAULT_REFS
+
+    # Add user-uploaded session refs
+    session_refs = tool_context.state.get("session_refs", [])
+    session_ref_parts = _build_session_ref_parts(session_refs)
 
     parts.extend(ref_parts)
-    image_desc = "\n".join(f"- IMG_{i} 是{img['role']}" for i, img in enumerate(active_refs_info, 1))
-    parts.append({"text": f"以上{len(active_refs_info)}张图片：\n{image_desc}\n\n请生成提示词，要求：{scene_description}"})
+    parts.extend(session_ref_parts)
+
+    all_refs_info = list(active_refs_info) + [{"role": r["role"]} for r in session_refs]
+    image_desc = "\n".join(f"- IMG_{i} 是{img['role']}" for i, img in enumerate(all_refs_info, 1))
+    parts.append({"text": f"以上{len(all_refs_info)}张图片：\n{image_desc}\n\n请生成提示词，要求：{scene_description}"})
 
     url = (f"https://aiplatform.googleapis.com/v1/projects/{PROJECT}"
            f"/locations/{REGION}/publishers/google/models/gemini-3.5-flash:generateContent")
@@ -240,6 +302,8 @@ async def generate_images(num_images: int, tool_context: ToolContext) -> dict:
     parts = [{"text": CHAR_REF_PREFIX}]
     active = tool_context.state.get("active_refs")
     parts.extend(_build_active_ref_parts(active) if active else _build_ref_parts())
+    session_refs = tool_context.state.get("session_refs", [])
+    parts.extend(_build_session_ref_parts(session_refs))
     parts.append({"text": optimized_prompt})
 
     url = (f"https://aiplatform.googleapis.com/v1/projects/{PROJECT}"
@@ -480,6 +544,8 @@ async def edit_image(image_name: str, edit_instruction: str, tool_context: ToolC
     parts = [{"text": CHAR_REF_PREFIX}]
     active = tool_context.state.get("active_refs")
     parts.extend(_build_active_ref_parts(active) if active else _build_ref_parts())
+    session_refs = tool_context.state.get("session_refs", [])
+    parts.extend(_build_session_ref_parts(session_refs))
     parts.append({"text": "=== 需要修改的原图 ==="})
     parts.append({"inline_data": {"mime_type": "image/png", "data": original_b64}})
     parts.append({"text": edit_prompt})
@@ -597,30 +663,6 @@ async def edit_image(image_name: str, edit_instruction: str, tool_context: ToolC
         }
 
 
-async def upload_reference(image_role: str, tool_context: ToolContext) -> dict:
-    """Upload a user-provided reference image to replace or add to the default character references.
-    The user should attach an image in their message before calling this tool.
-
-    Args:
-        image_role: Description of what this image is, e.g. "新角色参考" or "替换狐狸角色参考"
-    """
-    logger.info(f"📤 [Upload] Reference image: {image_role}")
-
-    # Check if user attached an image in the current session events
-    # Look through recent events for inline image data
-    session_events = tool_context.state.get("_user_images", [])
-
-    # Store the role for this reference - actual image comes from user message
-    custom_refs = tool_context.state.get("custom_refs", [])
-    custom_refs.append({"role": image_role})
-    tool_context.state["custom_refs"] = custom_refs
-
-    logger.info(f"  ✅ Added custom reference: {image_role} (total custom refs: {len(custom_refs)})")
-    return {
-        "status": "success",
-        "message": f"已添加自定义参考图 '{image_role}'。请在消息中直接附带图片，生成时会自动使用。",
-        "total_custom_refs": len(custom_refs)
-    }
 
 
 # === Agent Definition ===
@@ -663,12 +705,15 @@ root_agent = Agent(
 用户说"修改第X张图" → edit_image
 
 === 自定义参考图 ===
-用户随时可以在对话中附带图片作为参考素材，调用 upload_reference 记录
+- 用户可以在消息中附带图片，然后说"这是xx角色参考" → 调用 add_reference_image(role="xx角色参考")
+- 用户可以完全不使用默认的动物角色，只用自己上传的图
+- 如果用户只上传了图片没有默认角色 → select_references([]) 传空列表，只使用用户上传的
+- 支持任何类型的角色：动物、人物、机器人、怪兽等
 
 === 重要 ===
 - 不要预设"必须是6个动物角色"或"必须在中国地标"——这些由用户决定
 - 评估标准基于用户提供的参考图，没有参考图则只评估画面质量和动作合理性
 - 灵活适应各种生图需求""",
-    tools=[select_references, optimize_prompt, generate_images, evaluate_and_select, refine_prompt, edit_image, upload_reference, PreloadMemoryTool()],
+    tools=[select_references, add_reference_image, optimize_prompt, generate_images, evaluate_and_select, refine_prompt, edit_image, PreloadMemoryTool()],
     after_agent_callback=save_memories_callback,
 )

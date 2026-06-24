@@ -608,9 +608,11 @@ root_agent = Agent(
 
 === 生成流程 ===
 1. 确认素材充分后 → optimize_prompt（基于用户提供的参考图和描述）
-2. generate_images（默认1张，用户可指定数量）
-3. evaluate_and_select（评估与参考图的一致性）
-4. 不通过则 refine_prompt → 再生成 → 再评估（最多2轮）
+2. generate_images（数量 = 用户要求的最终图片数 + 1，如用户要1张则生成2张用于筛选）
+3. evaluate_and_select（num_target = 用户要求的最终数量）
+4. 不通过则 refine_prompt → 再生成(still_needed+1) → 再评估（最多2轮）
+
+⚠️ 严格规则：generate_images 的数量 = 用户要求数量 + 1，不要多生成！用户要1张就生成2张，要3张就生成4张。
 
 === 编辑流程 ===
 用户说"修改第X张图" → edit_image

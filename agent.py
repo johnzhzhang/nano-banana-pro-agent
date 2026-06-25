@@ -10,6 +10,7 @@ from google.adk.agents.callback_context import CallbackContext
 from google.adk.tools.tool_context import ToolContext
 from google.adk.tools.preload_memory_tool import PreloadMemoryTool
 import google.genai.types as types
+from llm import GeminiWithLocation
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("ref2image_agent")
@@ -679,7 +680,7 @@ async def edit_image(image_name: str, edit_instruction: str, tool_context: ToolC
 
 # === Agent Definition ===
 root_agent = Agent(
-    model="gemini-3.5-flash",
+    model=GeminiWithLocation(model="gemini-3.5-flash", location="global"),
     name="ref2image_agent",
     description="Upload reference images, generate matching images with automatic quality evaluation and iterative refinement.",
     instruction="""你是一个通用的图像生成助手。根据用户提供的参考图和描述生成高质量图片。

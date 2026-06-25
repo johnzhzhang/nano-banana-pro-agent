@@ -1,91 +1,101 @@
 #!/bin/bash
 set -e
 
-PROJECT_ID="${1:-$(gcloud config get-value project 2>/dev/null)}"
-REGION="${2:-us-central1}"
-STAGING_BUCKET="gs://${PROJECT_ID}-adk-staging"
+GE_APP_ID=""
+POSITIONAL=()
+for arg in "$@"; do
+  case $arg in
+    --ge=*) GE_APP_ID="${arg#*=}" ;;
+    --ge) GE_APP_ID="__NEXT__" ;;
+    *)
+      if [ "$GE_APP_ID" = "__NEXT__" ]; then
+        GE_APP_ID="$arg"
+      else
+        POSITIONAL+=("$arg")
+      fi
+      ;;
+  esac
+done
 
-echo "============================================"
-echo "  Nano Banana Pro Agent - Deploy"
-echo "  Project: ${PROJECT_ID}"
-echo "  Region:  ${REGION}"
-echo "============================================"
+PROJECT_ID="${POSITIONAL[0]:?Usage: bash deploy.sh <PROJECT_ID> [REGION] [--ge APP_ID]}"
+REGION="${POSITIONAL[1]:-us-central1}"
 
-# 1. Enable APIs
-echo ""
-echo ">>> [1/5] Enabling GCP APIs..."
-gcloud services enable aiplatform.googleapis.com --project="${PROJECT_ID}" --quiet
-gcloud services enable storage.googleapis.com --project="${PROJECT_ID}" --quiet
-echo "    ✅ APIs enabled"
+echo "Deploying Ref2Image Agent to project: $PROJECT_ID (region: $REGION)"
+[ -n "$GE_APP_ID" ] && echo "  + Gemini Enterprise registration (APP_ID: $GE_APP_ID)"
 
-# 2. Create staging bucket
-echo ""
-echo ">>> [2/5] Ensuring staging bucket: ${STAGING_BUCKET}"
-if gcloud storage buckets describe "${STAGING_BUCKET}" --project="${PROJECT_ID}" > /dev/null 2>&1; then
-    echo "    ✅ Bucket exists"
-else
-    gcloud storage buckets create "${STAGING_BUCKET}" --project="${PROJECT_ID}" --location="${REGION}" --quiet
-    echo "    ✅ Bucket created"
+gcloud config set project "$PROJECT_ID"
+
+# Enable required APIs
+gcloud services enable aiplatform.googleapis.com --project="$PROJECT_ID" --quiet
+gcloud services enable storage.googleapis.com --project="$PROJECT_ID" --quiet
+
+# Setup GCP resources
+if [ -f setup.sh ]; then
+    bash setup.sh "$PROJECT_ID" "$REGION"
 fi
 
-# 3. Install dependencies
-echo ""
-echo ">>> [3/5] Installing Python dependencies..."
-pip install --quiet "google-cloud-aiplatform[agent_engines,adk]>=1.112" "google-adk>=2.0" "google-auth" "requests" 2>&1 | tail -3
-echo "    ✅ Dependencies installed"
+# Install & deploy
+uv sync
+uv pip install google-agents-cli --python .venv/bin/python
 
-# 4. Deploy agent
-echo ""
-echo ">>> [4/5] Deploying agent to Agent Engine..."
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+DEPLOY_OUTPUT=$(GOOGLE_CLOUD_PROJECT="$PROJECT_ID" GOOGLE_CLOUD_LOCATION="$REGION" \
+  GOOGLE_CLOUD_REGION="global" \
+  .venv/bin/agents-cli deploy --project "$PROJECT_ID" --region "$REGION" \
+  --update-env-vars "GOOGLE_CLOUD_PROJECT=${PROJECT_ID},GOOGLE_CLOUD_REGION=global" \
+  2>&1 | tee /dev/stderr) || true
 
-python3 - <<PYEOF
-import os, sys
-os.environ["GOOGLE_CLOUD_PROJECT"] = "${PROJECT_ID}"
-os.environ["GOOGLE_CLOUD_LOCATION"] = "${REGION}"
-os.environ["GOOGLE_GENAI_USE_VERTEXAI"] = "1"
+REASONING_ENGINE_ID=$(echo "$DEPLOY_OUTPUT" | grep -oP 'reasoningEngines/\K\d+' | tail -1)
+echo "Agent Engine deployment complete!"
+[ -n "$REASONING_ENGINE_ID" ] && echo "  Reasoning Engine ID: $REASONING_ENGINE_ID"
 
-sys.path.insert(0, "${SCRIPT_DIR}")
+# GE registration
+if [ -n "$GE_APP_ID" ] && [ -n "$REASONING_ENGINE_ID" ]; then
+    PROJECT_NUM=$(gcloud projects describe "$PROJECT_ID" --format='value(projectNumber)')
+    ACCESS_TOKEN=$(gcloud auth print-access-token)
 
-import vertexai
-from vertexai.agent_engines import AdkApp
+    AGENT_NAME="$(basename $(pwd))"
+    if command -v python3 &>/dev/null && [ -f agent.yaml ]; then
+        DISPLAY_NAME=$(python3 -c "
+import yaml
+d = yaml.safe_load(open('agent.yaml'))
+dn = d.get('displayName', {})
+print(dn.get('en', dn) if isinstance(dn, dict) else dn)
+" 2>/dev/null || echo "$AGENT_NAME")
+        AGENT_DESC=$(python3 -c "
+import yaml
+d = yaml.safe_load(open('agent.yaml'))
+desc = d.get('description', {})
+print(desc.get('en', desc) if isinstance(desc, dict) else desc)
+" 2>/dev/null || echo "$DISPLAY_NAME")
+    else
+        DISPLAY_NAME="$AGENT_NAME"
+        AGENT_DESC="$AGENT_NAME"
+    fi
 
-# Load agent via exec to avoid module import issues with cloudpickle
-agent_globals = {"__name__": "__main__", "__file__": "${SCRIPT_DIR}/agent.py"}
-with open("${SCRIPT_DIR}/agent.py") as f:
-    exec(compile(f.read(), "${SCRIPT_DIR}/agent.py", "exec"), agent_globals)
+    REGISTER_RESPONSE=$(curl -s -X POST \
+      "https://discoveryengine.googleapis.com/v1alpha/projects/${PROJECT_NUM}/locations/global/collections/default_collection/engines/${GE_APP_ID}/assistants/default_assistant/agents" \
+      -H "Authorization: Bearer ${ACCESS_TOKEN}" \
+      -H "Content-Type: application/json" \
+      -H "X-Goog-User-Project: ${PROJECT_NUM}" \
+      -d "{
+        \"displayName\": \"${DISPLAY_NAME}\",
+        \"description\": \"${AGENT_DESC}\",
+        \"adk_agent_definition\": {
+          \"tool_settings\": { \"tool_description\": \"${AGENT_DESC}\" },
+          \"provisioned_reasoning_engine\": {
+            \"reasoning_engine\": \"projects/${PROJECT_NUM}/locations/${REGION}/reasoningEngines/${REASONING_ENGINE_ID}\"
+          }
+        }
+      }")
 
-root_agent = agent_globals["root_agent"]
+    if echo "$REGISTER_RESPONSE" | grep -q '"name"'; then
+        echo "Gemini Enterprise registration successful!"
+    else
+        echo "Gemini Enterprise registration failed:"
+        echo "$REGISTER_RESPONSE" | python3 -m json.tool 2>/dev/null || echo "$REGISTER_RESPONSE"
+    fi
+elif [ -n "$GE_APP_ID" ] && [ -z "$REASONING_ENGINE_ID" ]; then
+    echo "Skipping GE registration (Agent Engine deploy failed — no Reasoning Engine ID)"
+fi
 
-client = vertexai.Client(project="${PROJECT_ID}", location="${REGION}")
-app = AdkApp(agent=root_agent)
-
-print("    Creating Agent Engine resource (this may take 2-5 minutes)...")
-remote_agent = client.agent_engines.create(
-    agent=app,
-    config={
-        "requirements": [
-            "google-cloud-aiplatform[agent_engines,adk]>=1.112",
-            "google-adk>=2.0",
-            "google-auth",
-            "requests",
-        ],
-        "staging_bucket": "${STAGING_BUCKET}",
-    }
-)
-
-resource_name = remote_agent.api_resource.name
-agent_id = resource_name.split("/")[-1]
-print(f"    ✅ Agent deployed! ID: {agent_id}")
-print(f"    Resource: {resource_name}")
-
-with open("${SCRIPT_DIR}/.agent_id", "w") as f:
-    f.write(agent_id)
-PYEOF
-
-# 5. Done
-echo ""
-echo "============================================"
-echo "  ✅ Deployment complete!"
-echo "  Agent ID saved to .agent_id"
-echo "============================================"
+echo "Deployment complete!"

@@ -13,3 +13,9 @@ dependencies = [
 [build-system]
 requires = ["setuptools>=68.0"]
 build-backend = "setuptools.build_meta"
+
+[tool.agents-cli]
+agent_directory = "."
+
+[tool.agents-cli.create_params]
+deployment_target = "agent_runtime"

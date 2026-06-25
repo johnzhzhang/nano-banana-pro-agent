@@ -1,0 +1,7 @@
+name: ref2image-agent
+displayName:
+  zh: 参考图生图 Agent
+  en: Ref2Image Agent
+description:
+  zh: 上传参考图，自动提取特征、生成图片、评估一致性并迭代优化，确保生成结果严格匹配参考图和提示词要求。
+  en: Upload reference images, automatically extract features, generate images, evaluate consistency, and iteratively refine until outputs strictly match your references.

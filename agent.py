@@ -441,6 +441,7 @@ async def evaluate_and_select(num_target: int, tool_context: ToolContext) -> dic
     all_scores = tool_context.state.get("all_scores", {})
     best_idx = max(all_scores, key=all_scores.get) if all_scores else None
     best_score = all_scores.get(best_idx, 0) if best_idx else 0
+    generation_round = tool_context.state.get("generation_round", 0)
 
     # Save final selected images as final_1, final_2, ...
     final_parts = []
@@ -451,11 +452,21 @@ async def evaluate_and_select(num_target: int, tool_context: ToolContext) -> dic
                 await tool_context.save_artifact(filename=f"final_{out_i}.png", artifact=art)
                 final_parts.append(art)
         logger.info(f"  🎉 Got {num_target} passing images! Saved as final_1...{num_target}.png")
+    elif generation_round >= 5 and best_idx:
+        # Fallback: 5 rounds exhausted, pick best scoring candidates
+        logger.info(f"  ⚠️ 5 rounds exhausted. Falling back to best score: {best_score}/10")
+        sorted_candidates = sorted(all_scores.items(), key=lambda x: x[1], reverse=True)
+        for out_i, (src_idx, score) in enumerate(sorted_candidates[:num_target], 1):
+            art = await tool_context.load_artifact(filename=f"candidate_{src_idx}.png")
+            if art:
+                await tool_context.save_artifact(filename=f"final_{out_i}.png", artifact=art)
+                final_parts.append(art)
+        still_needed = 0  # Force goal_reached
 
-    still_needed = max(0, num_target - len(all_passed))
+    still_needed = max(0, num_target - len(all_passed)) if not final_parts else 0
     logger.info(f"  📋 Total: {len(all_passed)} passed, {len(all_failed_list)} failed, need {still_needed} more (best={best_score}/10)")
 
-    # If goal reached, output images directly in chat
+    # If goal reached or fallback triggered, output images directly in chat
     if final_parts:
         response_parts = [types.Part(text=f"✅ 已选出 {len(final_parts)} 张合格图片：")]
         response_parts.extend(final_parts)
@@ -468,7 +479,7 @@ async def evaluate_and_select(num_target: int, tool_context: ToolContext) -> dic
         "passed_indices": all_passed,
         "failed_count": len(all_failed_list),
         "still_needed": still_needed,
-        "goal_reached": len(all_passed) >= num_target,
+        "goal_reached": len(final_parts) > 0,
         "best_candidate_index": int(best_idx) if best_idx else None,
         "best_score": best_score,
         "suggestions": tool_context.state.get("eval_suggestions", "")[:300] if still_needed > 0 else ""

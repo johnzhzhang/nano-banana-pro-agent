@@ -4,16 +4,49 @@ Happy Element 图像生成 ADK Agent (v3)
 - Memory Bank 集成
 - 详细日志
 """
-import base64, json, logging, os, subprocess, time, requests
+import base64, json, os, subprocess, time, requests
 from google.adk.agents import Agent
 from google.adk.agents.callback_context import CallbackContext
 from google.adk.tools.tool_context import ToolContext
 from google.adk.tools.preload_memory_tool import PreloadMemoryTool
 import google.genai.types as types
-from .llm import GeminiWithLocation
+from google import genai
+from google.adk.models.google_llm import Gemini
+from pydantic import Field
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-logger = logging.getLogger("ref2image_agent")
+class GeminiWithLocation(Gemini):
+    location: str = Field(default="global")
+
+    @property
+    def api_client(self) -> genai.Client:
+        key = "_cached_client"
+        if not hasattr(self, key) or getattr(self, key) is None:
+            client = genai.Client(
+                location=self.location,
+                http_options=genai.types.HttpOptions(
+                    headers=self._tracking_headers(),
+                    retry_options=self.retry_options,
+                    base_url=self.base_url,
+                ),
+            )
+            object.__setattr__(self, key, client)
+        return getattr(self, key)
+
+    def __getstate__(self):
+        state = super().__getstate__() if hasattr(super(), "__getstate__") else self.__dict__.copy()
+        if isinstance(state, dict):
+            state.pop("_cached_client", None)
+        return state
+
+    def __setstate__(self, state):
+        if hasattr(super(), "__setstate__"):
+            super().__setstate__(state)
+        else:
+            self.__dict__.update(state)
+
+
+
+
 
 PROJECT = os.environ.get("GOOGLE_CLOUD_PROJECT", "john-poc-453315")
 REGION = os.environ.get("GOOGLE_CLOUD_REGION", "global")
@@ -131,12 +164,12 @@ def _build_session_ref_parts(session_refs):
 
 async def save_memories_callback(callback_context: CallbackContext):
     """After each agent turn, save session events to Memory Bank."""
-    logger.info("💾 Saving session events to Memory Bank...")
+    print("💾 Saving session events to Memory Bank...")
     try:
         await callback_context.add_events_to_memory(events=callback_context.session.events[-5:-1])
-        logger.info("✅ Memory saved successfully")
+        print("✅ Memory saved successfully")
     except Exception as e:
-        logger.warning(f"⚠️ Memory Bank not available (skipping): {e}")
+        print(f"⚠️ Memory Bank not available (skipping): {e}")
     return None
 
 
@@ -157,34 +190,80 @@ FEATURE_EXTRACT_PROMPT = """请仔细观察这张角色参考图，详细提取�
 用简洁精确的中文描述，不要遗漏任何视觉细节。"""
 
 
-async def add_reference_image(role: str, tool_context: ToolContext) -> dict:
-    """Register a user-uploaded image as a reference. Automatically extracts detailed visual features using Flash.
+async def add_reference_image(role: str, image_url: str, tool_context: ToolContext) -> dict:
+    """Register an image as a reference. Provide image_url or leave empty to find from upload.
 
     Args:
-        role: What this image represents, e.g. "机器人角色参考" or "赛博朋克风格参考"
+        role: What this image represents, e.g. "角色参考" or "风格参考"
+        image_url: Image URL (http/https/gs://). Pass empty string if image was uploaded in message.
     """
-    logger.info(f"📤 [AddRef] Adding reference: {role}")
+    print(f"📤 [AddRef] Adding reference: {role}")
+
+    # Try URL first
+    img_data = None
+    if image_url and image_url.strip():
+        try:
+            url_str = image_url.strip()
+            if url_str.startswith("gs://"):
+                from google.cloud import storage as gcs_storage
+                client = gcs_storage.Client()
+                bucket_name = url_str.split("/")[2]
+                blob_name = "/".join(url_str.split("/")[3:])
+                file_bytes = client.bucket(bucket_name).blob(blob_name).download_as_bytes()
+            else:
+                file_bytes = requests.get(url_str, timeout=30).content
+            mime = "image/jpeg" if any(x in url_str for x in [".jpg", ".jpeg"]) else "image/png"
+            img_data = {"role": role, "data": base64.b64encode(file_bytes).decode(), "mime_type": mime}
+        except Exception:
+            pass
 
     # Search recent session events for user-uploaded images
-    img_data = None
-    for event in reversed(tool_context.session.events):
-        if event.content and event.content.parts:
-            for part in event.content.parts:
-                if hasattr(part, 'inline_data') and part.inline_data and part.inline_data.data:
-                    img_data = {
-                        "role": role,
-                        "data": base64.b64encode(part.inline_data.data).decode(),
-                        "mime_type": part.inline_data.mime_type or "image/png"
-                    }
-                    break
-        if img_data:
-            break
+    if not img_data:
+        for event in reversed(tool_context.session.events):
+            if event.content and event.content.parts:
+                for part in event.content.parts:
+                    if hasattr(part, 'inline_data') and part.inline_data and part.inline_data.data:
+                        img_data = {
+                            "role": role,
+                            "data": base64.b64encode(part.inline_data.data).decode(),
+                            "mime_type": part.inline_data.mime_type or "image/png"
+                        }
+                        break
+                    # Handle file_data (GE/Agent Engine - GCS URI)
+                    if hasattr(part, 'file_data') and part.file_data and part.file_data.file_uri:
+                        import google.auth
+                        import google.auth.transport.requests
+                        creds, _ = google.auth.default(scopes=["https://www.googleapis.com/auth/cloud-platform"])
+                        creds.refresh(google.auth.transport.requests.Request())
+                        uri = part.file_data.file_uri
+                        if uri.startswith("gs://"):
+                            from google.cloud import storage
+                            bucket_name = uri.split("/")[2]
+                            blob_name = "/".join(uri.split("/")[3:])
+                            client = storage.Client()
+                            file_bytes = client.bucket(bucket_name).blob(blob_name).download_as_bytes()
+                        else:
+                            file_bytes = requests.get(uri, headers={"Authorization": f"Bearer {creds.token}"}).content
+                        img_data = {
+                            "role": role,
+                            "data": base64.b64encode(file_bytes).decode(),
+                            "mime_type": part.file_data.mime_type or "image/png"
+                        }
+                        break
+            if img_data:
+                break
+
+    if not img_data:
+        captured = tool_context.state.get("captured_images", [])
+        if captured:
+            latest = captured[-1]
+            img_data = {"role": role, "data": latest["data"], "mime_type": latest["mime_type"]}
 
     if not img_data:
         return {"status": "error", "message": "未找到上传的图片。请在消息中附带图片后重试。"}
 
     # Use Flash to extract detailed visual features
-    logger.info(f"  🔍 Extracting visual features with Flash...")
+    print(f"  🔍 Extracting visual features with Flash...")
     token = _get_token()
     parts = [
         {"text": FEATURE_EXTRACT_PROMPT},
@@ -205,9 +284,9 @@ async def add_reference_image(role: str, tool_context: ToolContext) -> dict:
             for p in c.get("content", {}).get("parts", []):
                 if "text" in p:
                     description += p["text"]
-        logger.info(f"  ✅ Extracted features: {len(description)} chars")
+        print(f"  ✅ Extracted features: {len(description)} chars")
     else:
-        logger.warning(f"  ⚠️ Feature extraction failed: {resp.status_code}")
+        print(f"  ⚠️ Feature extraction failed: {resp.status_code}")
 
     img_data["description"] = description
 
@@ -215,7 +294,7 @@ async def add_reference_image(role: str, tool_context: ToolContext) -> dict:
     session_refs.append(img_data)
     tool_context.state["session_refs"] = session_refs
 
-    logger.info(f"  ✅ Added ref: {role} (total: {len(session_refs)})")
+    print(f"  ✅ Added ref: {role} (total: {len(session_refs)})")
     return {"status": "success", "role": role, "features": description[:300], "total_user_refs": len(session_refs)}
 
 
@@ -225,7 +304,7 @@ async def optimize_prompt(scene_description: str, tool_context: ToolContext) -> 
     Args:
         scene_description: The user's scene description, e.g. "3D卡通风格，小动物们在长城上玩耍"
     """
-    logger.info(f"🔧 [Stage 1] optimize_prompt: {scene_description[:100]}")
+    print(f"🔧 [Stage 1] optimize_prompt: {scene_description[:100]}")
     t0 = time.time()
     token = _get_token()
 
@@ -252,7 +331,7 @@ async def optimize_prompt(scene_description: str, tool_context: ToolContext) -> 
         json={"contents": [{"role": "USER", "parts": parts}],
               "generationConfig": {"temperature": 0.7, "maxOutputTokens": 8192}})
 
-    logger.info(f"  ⏱️ Flash: {resp.status_code} ({time.time()-t0:.1f}s)")
+    print(f"  ⏱️ Flash: {resp.status_code} ({time.time()-t0:.1f}s)")
     if resp.status_code != 200:
         return {"status": "error", "message": f"Flash API failed: {resp.status_code}"}
 
@@ -269,28 +348,29 @@ async def optimize_prompt(scene_description: str, tool_context: ToolContext) -> 
     tool_context.state.setdefault("failed_indices", [])
     tool_context.state.setdefault("all_scores", {})
     tool_context.state["eval_suggestions"] = ""
-    logger.info(f"  ✅ Prompt: {len(optimized)} chars")
+    print(f"  ✅ Prompt: {len(optimized)} chars")
     return {"status": "success", "prompt_length": len(optimized), "prompt_preview": optimized[:300]}
 
 
-async def generate_images(num_images: int, tool_context: ToolContext) -> dict:
-    """Generate images using the optimized prompt. Saves as artifacts.
+async def generate_and_evaluate(num_candidates: int, tool_context: ToolContext) -> dict:
+    """Generate candidate images, evaluate each one, and save the best as final.png.
+    Only final.png artifact will be visible to the user.
 
     Args:
-        num_images: Number of images to generate (default 1, max 6)
+        num_candidates: Number of candidate images to generate and evaluate (typically 2)
     """
     optimized_prompt = tool_context.state.get("optimized_prompt")
     if not optimized_prompt:
         return {"status": "error", "message": "No optimized prompt. Run optimize_prompt first."}
 
-    num_images = min(max(num_images, 1), 6)
+    num_candidates = min(max(num_candidates, 1), 4)
     round_num = tool_context.state.get("generation_round", 0) + 1
     tool_context.state["generation_round"] = round_num
-    total = tool_context.state.get("total_generated", 0)
 
-    logger.info(f"🎨 [Generate] Round {round_num}: generating {num_images} images...")
+    print(f"🎨 [Round {round_num}] Generating {num_candidates} candidates...")
     token = _get_token()
 
+    # Build generation request
     parts = [{"text": CHAR_REF_PREFIX}]
     session_refs = tool_context.state.get("session_refs", [])
     parts.extend(_build_session_ref_parts(session_refs))
@@ -308,181 +388,118 @@ async def generate_images(num_images: int, tool_context: ToolContext) -> dict:
         }
     }
 
-    generated = []
-    for i in range(num_images):
-        idx = total + i + 1
+    # Generate candidates (keep in memory only)
+    candidates_b64 = []
+    for i in range(num_candidates):
         t0 = time.time()
-        logger.info(f"  🖼️ Image {idx}...")
         resp = requests.post(url, headers=headers, json=request_body)
-        logger.info(f"  ⏱️ {resp.status_code} ({time.time()-t0:.1f}s)")
+        print(f"  🖼️ Candidate {i+1}: {resp.status_code} ({time.time()-t0:.1f}s)")
         if resp.status_code != 200:
             continue
         for c in resp.json().get("candidates", []):
             for p in c.get("content", {}).get("parts", []):
                 if "inlineData" in p:
-                    img_bytes = base64.b64decode(p["inlineData"]["data"])
-                    artifact = types.Part(inline_data=types.Blob(data=img_bytes, mime_type="image/png"))
-                    version = await tool_context.save_artifact(filename=f"candidate_{idx}.png", artifact=artifact)
-                    logger.info(f"  ✅ candidate_{idx}.png ({len(img_bytes)} bytes, v{version})")
-                    generated.append({"filename": f"candidate_{idx}.png", "index": idx})
+                    candidates_b64.append(p["inlineData"]["data"])
 
-    tool_context.state["total_generated"] = total + len(generated)
-    return {"status": "success", "images_generated": len(generated), "round": round_num, "artifacts": generated}
+    if not candidates_b64:
+        return {"status": "error", "message": "Image generation failed."}
 
+    # Evaluate each candidate
+    print(f"  🔍 Evaluating {len(candidates_b64)} candidates...")
+    eval_url = (f"https://aiplatform.googleapis.com/v1/projects/{PROJECT}"
+                f"/locations/{REGION}/publishers/google/models/gemini-3.5-flash:generateContent")
 
-async def evaluate_and_select(num_target: int, tool_context: ToolContext) -> dict:
-    """Evaluate each candidate image against reference images.
-    Returns which passed (score>=8) and which failed.
-
-    Args:
-        num_target: How many passing images are needed (e.g. 1 for single image, 3 for batch)
-    """
-    num_target = max(num_target, 1)
-    logger.info(f"🔍 [Evaluate] Target: {num_target} passing images")
-    token = _get_token()
-    total = tool_context.state.get("total_generated", 0)
-
-    # Load all candidate images
-    candidates = []
-    for i in range(1, total + 1):
-        fname = f"candidate_{i}.png"
-        try:
-            art = await tool_context.load_artifact(filename=fname)
-            if art and art.inline_data and art.inline_data.data:
-                candidates.append((i, base64.b64encode(art.inline_data.data).decode()))
-        except Exception:
-            pass
-
-    if not candidates:
-        return {"status": "error", "message": "No candidate images found."}
-
-    # Skip already-evaluated ones
-    already_passed = tool_context.state.get("passed_indices", [])
-    already_failed = tool_context.state.get("failed_indices", [])
-    to_evaluate = [(i, d) for i, d in candidates if i not in already_passed and i not in already_failed]
-
-    if not to_evaluate:
-        return {"status": "done", "passed_count": len(already_passed), "passed_indices": already_passed}
-
-    logger.info(f"  📷 Evaluating {len(to_evaluate)} new candidates (already passed: {len(already_passed)})")
-
-    # Build ref parts for evaluation from session refs
+    # Build ref parts for eval
     ref_parts = []
-    session_refs = tool_context.state.get("session_refs", [])
     for ref in session_refs:
-        ref_parts.append({"text": f"[{ref['role']}]:"})
+        ref_parts.append({"text": "[" + ref["role"] + "]:"})
         ref_parts.append({"inline_data": {"mime_type": ref["mime_type"], "data": ref["data"]}})
 
-    url = (f"https://aiplatform.googleapis.com/v1/projects/{PROJECT}"
-           f"/locations/{REGION}/publishers/google/models/gemini-3.5-flash:generateContent")
-    auth_headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-
-    new_passed = []
-    new_failed = []
-    all_suggestions = []
-
-    for idx, img_b64 in to_evaluate:
+    scores = []
+    issues_list = []
+    for i, img_b64 in enumerate(candidates_b64):
         t0 = time.time()
-        parts = [{"text": EVALUATOR_SYSTEM}, {"text": "=== 角色参考图 ==="}]
-        parts.extend(ref_parts)
-        parts.append({"text": f"=== 生成目标（提示词要求）===\n{tool_context.state.get('optimized_prompt', '')[:1000]}"})
-        parts.append({"text": "=== 生成图 ==="})
-        parts.append({"inline_data": {"mime_type": "image/png", "data": img_b64}})
-        parts.append({"text": "对照参考图和提示词要求，评估这张图。输出JSON。"})
+        eval_parts = [{"text": EVALUATOR_SYSTEM}, {"text": "=== 角色参考图 ==="}]
+        eval_parts.extend(ref_parts)
+        eval_parts.append({"text": "=== 生成目标 ===\n" + optimized_prompt[:800]})
+        eval_parts.append({"text": "=== 生成图 ==="})
+        eval_parts.append({"inline_data": {"mime_type": "image/png", "data": img_b64}})
+        eval_parts.append({"text": "对照参考图和提示词要求，评估这张图。输出JSON。"})
 
-        resp = requests.post(url, headers=auth_headers,
-            json={"contents": [{"role": "USER", "parts": parts}],
+        resp = requests.post(eval_url, headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+            json={"contents": [{"role": "USER", "parts": eval_parts}],
                   "generationConfig": {"temperature": 0.2, "maxOutputTokens": 2048}})
 
-        elapsed = time.time() - t0
-        if resp.status_code != 200:
-            logger.error(f"  ❌ Eval candidate_{idx} API error")
-            new_failed.append(idx)
-            continue
+        score = 0
+        issue_text = ""
+        if resp.status_code == 200:
+            eval_text = ""
+            for c in resp.json().get("candidates", []):
+                for p in c.get("content", {}).get("parts", []):
+                    if "text" in p:
+                        eval_text += p["text"]
+            try:
+                clean = eval_text.strip()
+                if clean.startswith("```"):
+                    clean = clean.split("\n", 1)[1].rsplit("```", 1)[0]
+                ev = json.loads(clean)
+                score = ev.get("score", 0)
+                issue_text = "; ".join([x.get("issue","") for x in ev.get("issues",[])])
+            except Exception:
+                score = 5
 
-        eval_text = ""
-        for c in resp.json().get("candidates", []):
-            for p in c.get("content", {}).get("parts", []):
-                if "text" in p:
-                    eval_text += p["text"]
+        scores.append(score)
+        issues_list.append(issue_text)
+        print(f"  📊 Candidate {i+1}: {score}/10 ({time.time()-t0:.1f}s)")
 
-        try:
-            clean = eval_text.strip()
-            if clean.startswith("```"):
-                clean = clean.split("\n", 1)[1].rsplit("```", 1)[0]
-            ev = json.loads(clean)
-        except json.JSONDecodeError:
-            ev = {"score": 5, "pass": False, "suggestions": eval_text[:200]}
+    # Pick the best
+    best_idx = scores.index(max(scores))
+    best_score = scores[best_idx]
 
-        score = ev.get("score", 0)
-        passed = ev.get("pass", score >= 8)
-        logger.info(f"  📊 candidate_{idx}: score={score}/10 {'✅' if passed else '❌'} ({elapsed:.1f}s)")
+    # Track best score across rounds (no image data to avoid 10MB state limit)
+    tool_context.state["best_overall_score"] = max(tool_context.state.get("best_overall_score", 0), best_score)
 
-        # Track all scores
-        all_scores = tool_context.state.get("all_scores", {})
-        all_scores[str(idx)] = score
-        tool_context.state["all_scores"] = all_scores
+    # If passes threshold, save as final
+    if best_score >= 8:
+        img_bytes = base64.b64decode(candidates_b64[best_idx])
+        art = types.Part(inline_data=types.Blob(data=img_bytes, mime_type="image/png"))
+        await tool_context.save_artifact(filename="final.png", artifact=art)
+        print(f"  🎉 Passed! Saved final.png (score={best_score})")
+        return {
+            "status": "success",
+            "goal_reached": True,
+            "final_image": "final.png",
+            "best_score": best_score,
+            "round": round_num,
+            "all_scores": [{"candidate": i+1, "score": s, "issues": iss} for i, (s, iss) in enumerate(zip(scores, issues_list))]
+        }
 
-        if passed:
-            new_passed.append(idx)
-        else:
-            new_failed.append(idx)
-            if ev.get("suggestions"):
-                all_suggestions.append(ev["suggestions"])
+    # If 3 rounds exhausted, use current round's best candidate
+    if round_num >= 3:
+        img_bytes = base64.b64decode(candidates_b64[best_idx])
+        art = types.Part(inline_data=types.Blob(data=img_bytes, mime_type="image/png"))
+        await tool_context.save_artifact(filename="final.png", artifact=art)
+        print(f"  ⚠️ 3 rounds done. Best this round: {best_score}/10. Saved final.png")
+        return {
+            "status": "success",
+            "goal_reached": True,
+            "final_image": "final.png",
+            "best_score": best_score,
+            "round": round_num,
+            "fallback": True,
+            "all_scores": [{"candidate": i+1, "score": s, "issues": iss} for i, (s, iss) in enumerate(zip(scores, issues_list))]
+        }
 
-    # Update state
-    all_passed = already_passed + new_passed
-    all_failed_list = already_failed + new_failed
-    tool_context.state["passed_indices"] = all_passed
-    tool_context.state["failed_indices"] = all_failed_list
-    tool_context.state["eval_suggestions"] = "\n".join(all_suggestions) if all_suggestions else ""
-
-    # Find best scoring candidate overall
-    all_scores = tool_context.state.get("all_scores", {})
-    best_idx = max(all_scores, key=all_scores.get) if all_scores else None
-    best_score = all_scores.get(best_idx, 0) if best_idx else 0
-    generation_round = tool_context.state.get("generation_round", 0)
-
-    # Save final selected images as final_1, final_2, ...
-    final_parts = []
-    if len(all_passed) >= num_target:
-        for out_i, src_idx in enumerate(all_passed[:num_target], 1):
-            art = await tool_context.load_artifact(filename=f"candidate_{src_idx}.png")
-            if art:
-                await tool_context.save_artifact(filename=f"final_{out_i}.png", artifact=art)
-                final_parts.append(art)
-        logger.info(f"  🎉 Got {num_target} passing images! Saved as final_1...{num_target}.png")
-    elif generation_round >= 5 and best_idx:
-        # Fallback: 5 rounds exhausted, pick best scoring candidates
-        logger.info(f"  ⚠️ 5 rounds exhausted. Falling back to best score: {best_score}/10")
-        sorted_candidates = sorted(all_scores.items(), key=lambda x: x[1], reverse=True)
-        for out_i, (src_idx, score) in enumerate(sorted_candidates[:num_target], 1):
-            art = await tool_context.load_artifact(filename=f"candidate_{src_idx}.png")
-            if art:
-                await tool_context.save_artifact(filename=f"final_{out_i}.png", artifact=art)
-                final_parts.append(art)
-        still_needed = 0  # Force goal_reached
-
-    still_needed = max(0, num_target - len(all_passed)) if not final_parts else 0
-    logger.info(f"  📋 Total: {len(all_passed)} passed, {len(all_failed_list)} failed, need {still_needed} more (best={best_score}/10)")
-
-    # If goal reached or fallback triggered, output images directly in chat
-    if final_parts:
-        response_parts = [types.Part(text=f"✅ 已选出 {len(final_parts)} 张合格图片：")]
-        response_parts.extend(final_parts)
-        tool_context.actions.skip_summarization = True
-        tool_context.actions.escalate = True
-
+    # Need more rounds
+    suggestions = "; ".join([iss for iss in issues_list if iss])
+    tool_context.state["eval_suggestions"] = suggestions
     return {
-        "status": "success",
-        "passed_count": len(all_passed),
-        "passed_indices": all_passed,
-        "failed_count": len(all_failed_list),
-        "still_needed": still_needed,
-        "goal_reached": len(final_parts) > 0,
-        "best_candidate_index": int(best_idx) if best_idx else None,
+        "status": "needs_refinement",
+        "goal_reached": False,
         "best_score": best_score,
-        "suggestions": tool_context.state.get("eval_suggestions", "")[:300] if still_needed > 0 else ""
+        "round": round_num,
+        "all_scores": [{"candidate": i+1, "score": s, "issues": iss} for i, (s, iss) in enumerate(zip(scores, issues_list))],
+        "suggestions": suggestions[:300]
     }
 
 
@@ -495,7 +512,7 @@ async def refine_prompt(tool_context: ToolContext) -> dict:
     if not suggestions:
         return {"status": "skip", "message": "No suggestions to refine."}
 
-    logger.info("📝 [Refine] Refining prompt based on evaluation...")
+    print("📝 [Refine] Refining prompt based on evaluation...")
     token = _get_token()
 
     parts = [{"text": f"""修改以下提示词来解决角色一致性问题。只修正问题部分，保持整体结构不变。
@@ -529,7 +546,7 @@ async def refine_prompt(tool_context: ToolContext) -> dict:
 
     tool_context.state["optimized_prompt"] = refined
     tool_context.state["eval_suggestions"] = ""  # Clear after refining
-    logger.info(f"  ✅ Prompt refined: {len(refined)} chars")
+    print(f"  ✅ Prompt refined: {len(refined)} chars")
     return {"status": "success", "prompt_length": len(refined)}
 
 
@@ -540,7 +557,7 @@ async def edit_image(image_name: str, edit_instruction: str, tool_context: ToolC
         image_name: Which image to edit, e.g. "final_1.png"
         edit_instruction: What to change, e.g. "熊的腮红要更明显，颜色要更粉"
     """
-    logger.info(f"✏️ [Edit] {image_name}: {edit_instruction[:80]}")
+    print(f"✏️ [Edit] {image_name}: {edit_instruction[:80]}")
     token = _get_token()
 
     # Load the original image
@@ -587,9 +604,9 @@ async def edit_image(image_name: str, edit_instruction: str, tool_context: ToolC
     edit_candidates = []
     for i in range(2):
         t0 = time.time()
-        logger.info(f"  🖼️ Generating edit candidate {i+1}/2...")
+        print(f"  🖼️ Generating edit candidate {i+1}/2...")
         resp = requests.post(url, headers=headers, json=request_body)
-        logger.info(f"  ⏱️ {resp.status_code} ({time.time()-t0:.1f}s)")
+        print(f"  ⏱️ {resp.status_code} ({time.time()-t0:.1f}s)")
         if resp.status_code != 200:
             continue
         for c in resp.json().get("candidates", []):
@@ -600,13 +617,13 @@ async def edit_image(image_name: str, edit_instruction: str, tool_context: ToolC
                     # Save as edit candidate artifact
                     artifact = types.Part(inline_data=types.Blob(data=img_bytes, mime_type="image/png"))
                     await tool_context.save_artifact(filename=f"edit_candidate_{i+1}.png", artifact=artifact)
-                    logger.info(f"  ✅ edit_candidate_{i+1}.png ({len(img_bytes)} bytes)")
+                    print(f"  ✅ edit_candidate_{i+1}.png ({len(img_bytes)} bytes)")
 
     if not edit_candidates:
         return {"status": "error", "message": "Failed to generate edit candidates."}
 
     # Evaluate each candidate
-    logger.info("  🔍 Evaluating edit candidates...")
+    print("  🔍 Evaluating edit candidates...")
     ref_parts = []
     session_refs = tool_context.state.get("session_refs", [])
     for ref in session_refs:
@@ -653,7 +670,7 @@ async def edit_image(image_name: str, edit_instruction: str, tool_context: ToolC
             ev = {"score": 5, "pass": False}
 
         score = ev.get("score", 0)
-        logger.info(f"  📊 edit_candidate_{i+1}: score={score}/10")
+        print(f"  📊 edit_candidate_{i+1}: score={score}/10")
         results.append({"index": i+1, "score": score, "pass": score >= 8})
 
         if score > best_score:
@@ -664,7 +681,7 @@ async def edit_image(image_name: str, edit_instruction: str, tool_context: ToolC
     if best_score >= 8:
         best_artifact = types.Part(inline_data=types.Blob(data=edit_candidates[best_idx], mime_type="image/png"))
         await tool_context.save_artifact(filename=image_name, artifact=best_artifact)
-        logger.info(f"  🎉 Edit passed! Replaced {image_name} with candidate {best_idx+1} (score={best_score})")
+        print(f"  🎉 Edit passed! Replaced {image_name} with candidate {best_idx+1} (score={best_score})")
         # Show edited image inline in chat
         tool_context.actions.skip_summarization = True
         tool_context.actions.escalate = True
@@ -676,7 +693,7 @@ async def edit_image(image_name: str, edit_instruction: str, tool_context: ToolC
             "candidates": results
         }
     else:
-        logger.info(f"  ⚠️ Edit candidates didn't pass (best={best_score}). Keeping original.")
+        print(f"  ⚠️ Edit candidates didn't pass (best={best_score}). Keeping original.")
         return {
             "status": "success",
             "replaced": False,
@@ -690,6 +707,38 @@ async def edit_image(image_name: str, edit_instruction: str, tool_context: ToolC
 
 
 # === Agent Definition ===
+from google.adk.agents.callback_context import CallbackContext as _CBCtx
+from google.adk.models.llm_request import LlmRequest as _LReq
+
+def capture_user_images(callback_context: _CBCtx, llm_request: _LReq) -> None:
+    """Before model callback: extract user-uploaded images from request into state."""
+    for content in llm_request.contents:
+        if content.role == "user" and content.parts:
+            for part in content.parts:
+                if hasattr(part, "inline_data") and part.inline_data and getattr(part.inline_data, "data", None):
+                    img_b64 = base64.b64encode(part.inline_data.data).decode()
+                    mime = part.inline_data.mime_type or "image/png"
+                    captured = callback_context.state.get("captured_images", [])
+                    if not any(c.get("data", "")[:50] == img_b64[:50] for c in captured):
+                        captured.append({"data": img_b64, "mime_type": mime, "role": "user_upload"})
+                        callback_context.state["captured_images"] = captured
+
+
+def _capture_user_images(callback_context, llm_request) -> None:
+    """Before model callback: extract user images from LLM request into state."""
+    for content in llm_request.contents:
+        if content.role == "user" and content.parts:
+            for part in content.parts:
+                idata = getattr(part, "inline_data", None)
+                if idata and getattr(idata, "data", None):
+                    img_b64 = base64.b64encode(idata.data).decode()
+                    mime = idata.mime_type or "image/png"
+                    captured = callback_context.state.get("captured_images", [])
+                    if not any(c.get("data", "")[:50] == img_b64[:50] for c in captured):
+                        captured.append({"data": img_b64, "mime_type": mime, "role": "user_upload"})
+                        callback_context.state["captured_images"] = captured
+
+
 root_agent = Agent(
     model=GeminiWithLocation(model="gemini-3.5-flash", location="global"),
     name="ref2image_agent",
@@ -711,15 +760,27 @@ root_agent = Agent(
 === 生成流程 ===
 1. 用户上传参考图时 → add_reference_image 记录每张图的用途
 2. optimize_prompt（基于用户上传的参考图和描述）
-3. generate_images（数量 = 用户要求数 + 1）
-4. evaluate_and_select（num_target = 用户要求数量）
-5. 不通过则 refine_prompt → 再生成 → 再评估（最多重试5轮）
-6. 如果5轮后仍没有合格图片（score>=8），选所有候选中分数最高的作为最终结果
+3. generate_and_evaluate(2) — 生成2张候选并立即评估打分
+4. 如果返回 goal_reached=true → 最终图已保存为 final.png
+5. 如果返回 goal_reached=false → refine_prompt → generate_and_evaluate(2)（最多3轮）
 
 ⚠️ 严格规则：
-- generate_images 数量 = 用户要求数量 + 1，不要多生成！
-- 只使用用户上传的参考图，没有任何预置角色
-- 最多重试5轮，5轮后选最高分的交付
+- 你不能凭空描述图片！必须调用 generate_images 工具实际生成图片！
+- 绝对禁止：不调用工具就告诉用户"图已生成"
+- 只使用用户上传的参考图
+- 最多3轮重试后必须给出结果
+
+=== 输出格式（严格遵守）===
+每一步都告知用户进度，最终回复按以下顺序输出：
+
+1. 各轮次过程（分数+问题+优化措施）
+2. 最终选定说明（如"综合3轮共6张候选，候选3得分最高"）
+3. 画面亮点描述
+4. 修改建议
+5. 最后一行写："✅ 最终选定图片（得分 X/10）："
+6. 紧接着展示图片
+
+⚠️ 图片必须放在所有文字的最后面！先文字再图片！禁止图片出现在文字前面或中间。
 
 === 参考图管理 ===
 - 用户附图 + 说明 → add_reference_image(role="描述")
@@ -732,6 +793,7 @@ root_agent = Agent(
 === 重要 ===
 - 评估标准基于用户提供的参考图，没有参考图则只评估画面质量和动作合理性
 - 灵活适应各种生图需求""",
-    tools=[add_reference_image, optimize_prompt, generate_images, evaluate_and_select, refine_prompt, edit_image, PreloadMemoryTool()],
-    after_agent_callback=save_memories_callback,
+    tools=[add_reference_image, optimize_prompt, generate_and_evaluate, refine_prompt, edit_image],
+    before_model_callback=_capture_user_images,
+
 )
